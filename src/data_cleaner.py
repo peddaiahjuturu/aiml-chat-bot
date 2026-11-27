@@ -4,8 +4,7 @@ No missing value is ever filled in by a cleaner; cleaning only removes rows and 
 import os
 import pandas as pd
 
-RAW_DIR = os.path.join("data", "raw")
-CLEAN_DIR = os.path.join("data", "clean")
+from constants import CLEAN_DIR, RAW_DIR
 
 
 class BaseCleaner:

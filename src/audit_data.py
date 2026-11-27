@@ -1,12 +1,9 @@
 """audit_data.py -- prints shape, dtypes, and missing-value counts/percentages for the raw subscribers and recharges tables,
 plus the extra data-quality figures (duplicate rows, distinct id/spelling counts, orphan rows) used to size the cleaning rules.
 Run:  python src/audit_data.py"""
-import os
 import pandas as pd
 
-RAW_DATA_PATH = os.path.join("data", "raw")
-SUBSCRIBERS_PATH = os.path.join(RAW_DATA_PATH, "subscribers.csv")
-RECHARGES_PATH = os.path.join(RAW_DATA_PATH, "recharges.csv")
+from constants import RECHARGES_RAW_PATH as RECHARGES_PATH, SUBSCRIBERS_RAW_PATH as SUBSCRIBERS_PATH
 
 
 def audit(path):

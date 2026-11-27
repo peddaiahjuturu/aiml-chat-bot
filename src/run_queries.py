@@ -2,14 +2,12 @@
 Run:  python src/run_queries.py
 Requires data/tataplay.db to already exist (run store_db.py first).
 """
-import os
 import re
 import sqlite3
 
 import pandas as pd
 
-DB_PATH = os.path.join("data", "tataplay.db")
-QUERIES_PATH = os.path.join("sql", "queries.sql")
+from constants import DB_PATH, SQL_QUERIES_PATH as QUERIES_PATH
 
 
 def load_queries():

@@ -14,10 +14,8 @@ Rules applied, in order:
 import os
 import pandas as pd
 
-from data_cleaner import BaseCleaner, RAW_DIR, CLEAN_DIR
-
-SUBSCRIBERS_CLEAN_PATH = os.path.join(CLEAN_DIR, "subscribers.csv")
-SUBSCRIBERS_RAW_PATH = os.path.join(RAW_DIR, "subscribers.csv")
+from constants import SUBSCRIBERS_CLEAN_PATH, SUBSCRIBERS_RAW_PATH
+from data_cleaner import BaseCleaner
 
 
 class RechargesCleaner(BaseCleaner):

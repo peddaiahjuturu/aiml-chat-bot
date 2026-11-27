@@ -3,18 +3,16 @@ Run:  python src/store_db.py
 Requires data/clean/subscribers.csv, data/clean/recharges.csv and data/clean/plans.csv to already exist
 (run clean_subscribers.py, clean_recharges.py and clean_plans.py first).
 """
-import os
 import sqlite3
 
 import pandas as pd
 
-CLEAN_DIR = os.path.join("data", "clean")
-DB_PATH = os.path.join("data", "tataplay.db")
+from constants import DB_PATH, PLANS_CLEAN_PATH, RECHARGES_CLEAN_PATH, SUBSCRIBERS_CLEAN_PATH
 
 TABLES = {
-    "subscribers": os.path.join(CLEAN_DIR, "subscribers.csv"),
-    "recharges": os.path.join(CLEAN_DIR, "recharges.csv"),
-    "plans": os.path.join(CLEAN_DIR, "plans.csv"),
+    "subscribers": SUBSCRIBERS_CLEAN_PATH,
+    "recharges": RECHARGES_CLEAN_PATH,
+    "plans": PLANS_CLEAN_PATH,
 }
 
 

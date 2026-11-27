@@ -15,6 +15,8 @@ src/
   clean_plans.py         # copies data/raw/plans.csv -> data/clean/plans.csv unchanged
   store_db.py            # writes the three clean tables to data/tataplay.db (SQLite)
   run_queries.py         # runs sql/queries.sql against data/tataplay.db and prints results
+  churn_features.py      # builds the Part B churn modelling table (clean subscribers + recharge features)
+  churn_model.py         # Part B: split, leakage check, preprocessing, tuning, threshold selection, persistence
 sql/
   queries.sql            # the four analysis queries (Q1-Q4)
 data/
@@ -22,6 +24,9 @@ data/
   clean/                 # cleaned tables produced by the src/clean_*.py scripts
   policies/              # policy text documents used by the retention/support copilot
   tataplay.db             # SQLite database holding the clean subscribers/recharges/plans tables
+outputs/
+  churn_model.joblib      # persisted, fitted churn-prediction pipeline (selected model)
+  test_scores.csv         # per-test-subscriber churn probability + actual churned label
 ```
 
 ## Requirements
@@ -73,6 +78,10 @@ Minimum packages (see [requirements.txt](requirements.txt)):
    ```
 
    > **Do not use these two columns as features:** `closure_request_logged` and `next_cycle_recharge_inr`. They are not known at prediction time (they are only logged/known once a subscriber is already leaving or has started their next billing cycle), so they must be excluded from any churn-prediction model to avoid data leakage.
+
+## Part A -- Data Foundation: Audit, Clean, Store, Query
+
+Everything downstream trusts this Part. The raw exports contain duplicates, inconsistent spellings, impossible values and text where numbers belong. This Part produces the clean tables and the SQLite database that Parts B, C and D read. Data is cleaned in pandas; no missing value is filled in this Part (imputation belongs inside the Part B pipeline, after the split, so that no test row can influence it).
 
 ## Steps completed so far
 
@@ -220,4 +229,132 @@ python src/clean_recharges.py    # 4. clean recharges (depends on cleaned subscr
 python src/clean_plans.py        # 5. copy plans unchanged
 python src/store_db.py           # 6. write the three clean tables to data/tataplay.db
 python src/run_queries.py        # 7. run sql/queries.sql and print the results
+python src/churn_model.py        # 8. Part B: train, tune, select and persist the churn model
 ```
+
+## Part B -- Churn Prediction You Can Trust
+
+Predicts which subscribers will churn, using `data/clean/subscribers.csv` and `data/clean/recharges.csv` from Part A. Run with `python src/churn_model.py` (requires `data/clean/*.csv` to already exist).
+
+### 1. Framing
+
+| Question | Answer |
+|---|---|
+| What decision does the prediction drive? | Whether the retention desk proactively offers a retention deal to a subscriber before their next billing cycle. |
+| Who acts, and what do they do differently? | The retention desk; for subscribers flagged "will churn" they make a retention call / send a discount offer instead of doing nothing. |
+| Exact target column | `churned` (from `data/clean/subscribers.csv`). |
+| Is the target a number, a category, or absent? | A category -- binary (0 = stays, 1 = churns). |
+| Cost of a wrong prediction | Missing a subscriber who then leaves costs **INR 1,200** (lost revenue); offering a deal to a subscriber who would have stayed costs **INR 300** (wasted discount). |
+
+Class balance: **514 of 2,400 churned (21.42%)**.
+
+### 2. Modelling table, split, and leakage
+
+Each subscriber is joined to three recharge-derived features computed from the clean recharges as of the snapshot date **2026-03-31**: `n_success_6m`, `n_failed_6m` (counts of successful/failed recharges; 0 if the subscriber has no recharge rows), and `recency_days` (days since the last successful recharge; missing if none). `recency_days` is missing for **76 subscribers** -- the same 76 subscribers identified in Part A's Q2 as never having a successful recharge.
+
+- **12 numeric features:** `tenure_months, age, add_on_count, monthly_recharge_inr, hours_watched_per_week, hd_hours_per_week, sports_hours_per_week, channels_watched, support_calls_90d, n_success_6m, n_failed_6m, recency_days`
+- **4 categorical features:** `city, plan_id, payment_mode, auto_renew`
+
+**Split** (`train_test_split`, test first, then train/val out of the rest, both `stratify=y, random_state=42`):
+
+| Set | Rows | Churners |
+|---|---|---|
+| train | 1,440 | 308 |
+| validation | 480 | 103 |
+| test | 480 | 103 |
+
+`train` fits every imputer/scaler/encoder/model. `validation` is used to pick alert thresholds and to compare simple models and the cross-validated winners. `test` is touched exactly once, at the very end, for the single final report of the already-chosen model and threshold -- it is never used to fit, tune, or pick a threshold.
+
+**Leakage columns:** per the data dictionary's *Known when* column, `closure_request_logged` and `next_cycle_recharge_inr` are not known at prediction time (they're only logged once a subscriber is already leaving, or once their next billing cycle has happened) and must never be model features.
+
+Proof of the damage -- `RandomForestClassifier(n_estimators=100, random_state=42)` on the validation set:
+
+| Features | Accuracy | Churn F1 |
+|---|---|---|
+| **With** the two leakage columns | 0.983 | 0.961 |
+| **Without** the two leakage columns | 0.823 | 0.514 |
+
+A model that scores 0.983/0.961 by reading `closure_request_logged` is not shippable: that column is only written down once the cancellation process has already started, so in production, at the moment a prediction is actually needed, the column does not exist yet -- the "leaky" score measures how well the model can read an answer key, not how well it predicts the future.
+
+### 3. Preprocessing
+
+One `ColumnTransformer`, fit on the **training rows only**: numeric columns get `SimpleImputer(strategy="median")` then `StandardScaler`; categorical columns get `SimpleImputer(strategy="most_frequent")` then `OneHotEncoder(handle_unknown="ignore")`. Every later model is a `Pipeline` containing this transformer, so it is refit from scratch on whatever training fold that model sees -- it never sees validation or test rows.
+
+- Output columns: **31**
+- Learned median `age`: **38.0**
+- Scaler-learned mean `tenure_months` (train only): **22.65**, vs. full-data mean **22.46** -- they differ because the scaler only ever sees the training split, a random ~60% sample of all subscribers, so its mean carries ordinary sampling variation around the full-data mean.
+- Missing values remaining after transform: **0** (confirmed in code).
+
+### 4. Baseline, simple models, and overfitting
+
+Validation-set results:
+
+| Model | Accuracy | Precision | Recall | Churn F1 |
+|---|---|---|---|---|
+| Majority-class baseline | 0.785 | -- | 0 | 0.000 |
+| LogisticRegression(max_iter=1000) | 0.833 | 0.646 | 0.495 | 0.560 |
+
+| Model | Train accuracy | Validation churn F1 |
+|---|---|---|
+| Unrestricted DecisionTreeClassifier | 1.000 | 0.459 |
+| Default RandomForestClassifier(n_estimators=100) | 1.000 | 0.514 |
+
+`max_depth` sweep (DecisionTreeClassifier, train accuracy vs. validation churn F1):
+
+| depth | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| train_acc | 0.815 | 0.832 | 0.839 | 0.844 | 0.863 | 0.883 | 0.908 | 0.924 | 0.944 | 0.957 |
+| val_f1 | 0.434 | 0.413 | 0.408 | 0.422 | 0.529 | **0.545** | 0.488 | 0.489 | 0.468 | 0.440 |
+
+Best validation F1 is at `max_depth=6` (0.545). The widening gap between near-perfect training accuracy and a much lower (then falling) validation F1 shows the tree memorising training-set noise rather than a generalisable pattern; a greedy tree keeps splitting on whatever locally reduces impurity most, so without a depth limit it keeps carving out leaves that fit individual training rows instead of the underlying signal.
+
+### 5. Cross-validated tuning
+
+`StratifiedKFold(n_splits=5, shuffle=True, random_state=42)` + `GridSearchCV(scoring="f1")`, fit on the **training rows only**.
+
+| Model | Grid | Combinations | Fits | Best params | Best CV F1 (std) |
+|---|---|---|---|---|---|
+| LogisticRegression | `C in {0.01, 0.1, 1, 10, 100}` | 5 | 25 | `C=100` | 0.507 (0.035) |
+| RandomForestClassifier | `n_estimators in {50,100,150}`, `max_depth in {3,4,5,6,8}`, `max_features in {3,4,5}` | 45 | 225 | `max_depth=8, max_features=5, n_estimators=100` | 0.439 (0.061) |
+
+Logistic regression is more consistent across folds (CV std 0.035 vs. 0.061 for the random forest), which matters because a lower-variance model's validation/test performance is a more trustworthy estimate of how it will behave on new subscribers.
+
+### 6. Cost-based threshold selection and test-set evaluation
+
+For each tuned model, every threshold from 0.10 to 0.90 (step 0.05) is tried against its validation-set `predict_proba`; cost = `1,200 x missed churners + 300 x needless offers`. The cheapest threshold per model, chosen on validation:
+
+| Model | Threshold | Validation cost |
+|---|---|---|
+| Random forest | 0.30 | INR 53,100 |
+| Logistic regression | 0.20 | INR 56,400 |
+
+Reference policies on the test set: **no action** = INR 123,600 (1,200 x 103 test churners); **offer everybody** = INR 113,100 (300 x 377 non-churners).
+
+Applying each model with its validation-chosen threshold to the **test** set (touched here for the first and only time):
+
+| Model | tn | fp | fn | tp | Precision | Recall | F1 | Cost |
+|---|---|---|---|---|---|---|---|---|
+| Random forest @ 0.30 | 310 | 67 | 29 | 74 | 0.525 | 0.718 | 0.607 | INR 54,900 |
+| Logistic regression @ 0.20 | 275 | 102 | 17 | 86 | 0.457 | 0.835 | 0.591 | INR 51,000 |
+
+**Selected model: random forest** -- chosen on its lower validation cost (INR 53,100 vs. 56,400), not its test result. Random forest and logistic regression land close on cost, so the decision weighs robustness as much as raw cost; a tree ensemble's feature-importance ranking is also easy to explain to a non-technical retention desk ("more support calls -> higher risk"), similar to how logistic-regression coefficients would be explained, so explainability doesn't clearly favour either model here -- the validation cost breaks the tie.
+
+Acceptance check on test: cost is **44%** of the no-action cost (limit 60%, i.e. <= INR 74,160) -- **pass**; recall **0.718** (>= 0.55) -- **pass**; F1 **0.607** (>= 0.50) -- **pass**.
+
+### 7. Explain, persist, and score
+
+Top 5 random-forest feature importances (`feature_importances_`, names from the pipeline's `get_feature_names_out()`):
+
+| Feature | Importance | Business reading |
+|---|---|---|
+| `support_calls_90d` | 0.196 | More support calls in the last 90 days -> higher churn risk. |
+| `recency_days` | 0.091 | The longer since the last successful recharge, the higher the churn risk. |
+| `tenure_months` | 0.082 | Newer subscribers churn more; long-tenured subscribers are safer. |
+| `n_success_6m` | 0.079 | Subscribers with fewer successful recharges recently are more likely to churn. |
+| `hd_hours_per_week` | 0.067 | Lower HD viewing hours associate with higher churn risk. |
+
+LogisticRegression coefficient signs: `support_calls_90d` **+1.075** (more calls -> more likely to churn), `tenure_months` **-0.511** (longer tenure -> less likely to churn), `n_failed_6m` **+0.211** (more failed recharges -> more likely to churn).
+
+The selected (random forest) pipeline is saved with `joblib.dump` to `outputs/churn_model.joblib`; reloading it with `joblib.load` reproduces the exact same test-set predictions. `outputs/test_scores.csv` holds one row per test subscriber (480 rows) with columns `subscriber_id, churn_probability, churned`.
+
+**No test-set leakage:** the `ColumnTransformer` (imputer/scaler/encoder), every model fit, every `GridSearchCV` cross-validation fold, and the cost-based threshold search all only ever see `train` and/or `validation` rows. The `test` set is loaded only once, at the very end, to compute the final confusion matrix/metrics/cost for the already-selected model and its already-chosen threshold -- in that order: **train -> validation -> test**.
