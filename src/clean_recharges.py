@@ -7,7 +7,8 @@ Rules applied, in order:
   1. Remove exact duplicate rows.
   2. Remove recharges whose subscriber_id does not exist in the cleaned subscribers table.
   3. Lower-case the status column.
-  4. Rebuild amount_inr as a number, stripping a leading "INR " text prefix where present.
+  4. Convert amount_inr to a number; where it cannot be converted (e.g. "INR 498"), rebuild it
+     as that subscriber's monthly_recharge_inr from the subscribers table.
   5. Parse recharge_date into an actual date type.
 """
 import os
@@ -26,7 +27,9 @@ class RechargesCleaner(BaseCleaner):
     def clean(self, df):
         rules = []
         subscribers_path = SUBSCRIBERS_CLEAN_PATH if os.path.exists(SUBSCRIBERS_CLEAN_PATH) else SUBSCRIBERS_RAW_PATH
-        valid_ids = set(pd.read_csv(subscribers_path)["subscriber_id"])
+        subscribers_df = pd.read_csv(subscribers_path)
+        valid_ids = set(subscribers_df["subscriber_id"])
+        monthly_recharge = subscribers_df.set_index("subscriber_id")["monthly_recharge_inr"]
 
         # Remove exact duplicate rows first
         before = len(df)
@@ -44,11 +47,12 @@ class RechargesCleaner(BaseCleaner):
         df["status"] = status_lower
         rules.append(("Lower-cased status", int(changed)))
 
-        # Rebuild amount_inr as a number, stripping a leading "INR " text prefix where present
-        amount_text = df["amount_inr"].astype(str).str.strip()
-        rebuilt = amount_text.str.contains(r"[A-Za-z]", regex=True)
-        df["amount_inr"] = pd.to_numeric(amount_text.str.replace(r"[A-Za-z]+", "", regex=True).str.strip(), errors="coerce")
-        rules.append(("Rebuilt amount_inr as a number (stripped 'INR ' text)", int(rebuilt.sum())))
+        # Convert amount_inr to a number; where it cannot be converted, rebuild it as the
+        # subscriber's monthly_recharge_inr
+        numeric_amount = pd.to_numeric(df["amount_inr"], errors="coerce")
+        unparsable = numeric_amount.isna()
+        df["amount_inr"] = numeric_amount.where(~unparsable, df["subscriber_id"].map(monthly_recharge))
+        rules.append(("Rebuilt amount_inr from the subscriber's monthly_recharge_inr", int(unparsable.sum())))
 
         # Parse recharge_date into an actual date type
         parsed_date = pd.to_datetime(df["recharge_date"], errors="coerce")
@@ -59,7 +63,13 @@ class RechargesCleaner(BaseCleaner):
         return df, rules
 
     def summary_lines(self, df):
-        return [f"status values: {sorted(df['status'].dropna().unique())}"]
+        status_counts = df["status"].value_counts().to_dict()
+        total_success = df.loc[df["status"] == "success", "amount_inr"].sum()
+        return [
+            f"status values: {sorted(df['status'].dropna().unique())}",
+            f"status counts: {status_counts}",
+            f"Total successful recharge amount (INR): {total_success:.0f}",
+        ]
 
 
 if __name__ == "__main__":

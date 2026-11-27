@@ -58,9 +58,15 @@ class SubscribersCleaner(BaseCleaner):
         return df, rules
 
     def summary_lines(self, df):
+        churned = int(df["churned"].sum())
         return [
             f"Cities: {sorted(df['city'].dropna().unique())}",
+            f"City counts: {df['city'].value_counts().to_dict()}",
             f"auto_renew values: {sorted(df['auto_renew'].dropna().unique())}",
+            f"auto_renew counts: {df['auto_renew'].value_counts().to_dict()}",
+            f"Missing age remaining: {int(df['age'].isna().sum())}",
+            f"Missing payment_mode remaining: {int(df['payment_mode'].isna().sum())}",
+            f"Churned subscribers: {churned} ({churned / len(df) * 100:.2f}%)",
         ]
 
 
