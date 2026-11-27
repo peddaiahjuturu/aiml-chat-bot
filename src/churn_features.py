@@ -8,6 +8,7 @@ data/clean/recharges.csv as of the snapshot date 2026-03-31:
                     (missing if the subscriber has no successful recharge)
 Subscribers with no recharge rows at all get 0 for n_success_6m and n_failed_6m.
 """
+import numpy as np
 import pandas as pd
 
 from constants import RECHARGES_CLEAN_PATH as RECHARGES_PATH, SNAPSHOT, SUBSCRIBERS_CLEAN_PATH as SUBSCRIBERS_PATH
@@ -61,4 +62,37 @@ def build_feature_table(subscribers_path=SUBSCRIBERS_PATH, recharges_path=RECHAR
     # Drop the last_success_date column as it is no longer needed
     df = df.drop(columns=["last_success_date"])
 
+    return df
+
+
+def build_subscriber_row_from_db(conn, subscriber_id):
+    """Builds the same one-subscriber feature row as build_feature_table(), using SQL against the
+    Part A SQLite database (conn) instead of the clean CSVs -- used by copilot.py. n_success_6m and
+    n_failed_6m are summed with SQL (NULL treated as 0 via COALESCE, as in build_feature_table's
+    fillna(0)); recency_days is the gap to the last successful recharge on/before the snapshot date.
+    Values read back from SQLite as None are converted to NaN so the pipeline treats them as missing,
+    not as a literal category/value."""
+    subs_row = pd.read_sql_query(
+        "SELECT * FROM subscribers WHERE subscriber_id = ?", conn, params=(subscriber_id,)
+    )
+    if subs_row.empty:
+        raise ValueError(f"Unknown subscriber_id: {subscriber_id}")
+
+    agg = pd.read_sql_query(
+        """
+        SELECT
+            COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS n_success_6m,
+            COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS n_failed_6m,
+            MAX(CASE WHEN status = 'success' THEN recharge_date END) AS last_success_date
+        FROM recharges
+        WHERE subscriber_id = ? AND recharge_date <= ?
+        """,
+        conn, params=(subscriber_id, SNAPSHOT.strftime("%Y-%m-%d")),
+    )
+
+    df = subs_row.replace({None: np.nan})
+    df["n_success_6m"] = int(agg.loc[0, "n_success_6m"])
+    df["n_failed_6m"] = int(agg.loc[0, "n_failed_6m"])
+    last_success = agg.loc[0, "last_success_date"]
+    df["recency_days"] = (SNAPSHOT - pd.Timestamp(last_success)).days if last_success else np.nan
     return df

@@ -21,6 +21,12 @@ src/
   segments.py            # Part C: K-means subscriber segmentation -> outputs/segments.csv
   spend_model.py         # Part C: collinearity check + Ridge/Lasso next-cycle-recharge spend model
   revenue_at_risk.py     # Part C: revenue-at-risk priority list -> outputs/retention_priority.csv
+  llm_client.py          # Part D: reliable call_llm() client (mock by default, live via LLM_MODE=live)
+  llm_client_demo.py     # Part D: demonstrates 401/404/length/no-memory/rate-limit-retry behaviour
+  ticket_classifier.py   # Part D: weak/zero-shot/few-shot ticket classification -> outputs/ticket_classification.csv
+  ticket_extraction.py   # Part D: validated TicketRecord extraction with retry -> outputs/ticket_extractions.jsonl
+  policy_rag.py          # Part D: chunking + ChromaDB retrieval + grounded answer() -> outputs/rag_eval.csv
+  copilot.py             # Part D: Retention Copilot build_brief() -> outputs/retention_briefs.jsonl
 sql/
   queries.sql            # the four analysis queries (Q1-Q4)
 data/
@@ -33,6 +39,10 @@ outputs/
   test_scores.csv         # per-test-subscriber churn probability + actual churned label
   segments.csv            # subscriber_id, segment_id, segment_name for all 2,400 clean subscribers
   retention_priority.csv  # top-15 test subscribers ranked by revenue at risk
+  ticket_classification.csv  # ticket_id, true_category, zero_shot, few_shot for the 146 readable tickets
+  ticket_extractions.jsonl   # one line per ticket (150): ticket_id, status, attempts, record
+  rag_eval.csv               # the 16 policy_eval.csv questions: retrieval + grounded/ungrounded answers
+  retention_briefs.jsonl     # one validated retention brief per priority-list subscriber (15)
 ```
 
 ## Requirements
@@ -422,6 +432,125 @@ For the 480 Part B test subscribers, the tuned Ridge pipeline predicts `next_cyc
 
 This list is built from test-set subscribers whose outcome (`churned`) is already known -- it illustrates the revenue-at-risk method, it is **not** a forward-looking evaluation of unseen subscribers.
 
+## Part D -- Support Copilot: Prompts, Validation, Retrieval, Retention Briefs
+
+Built around the supplied offline `mock_llm.py`, using LangChain's prompt templates/parsers (`langchain_core`), Pydantic validation, and a ChromaDB vector store. **Embedding function used: `chromadb.utils.embedding_functions.ONNXMiniLM_L6_V2()`** (Chroma's built-in ONNX runtime for `all-MiniLM-L6-v2`), not `SentenceTransformerEmbeddingFunction`, to avoid the heavy PyTorch dependency -- it reproduces every reference number below.
+
+### A. A reliable client for the chat API (`src/llm_client.py`)
+
+`call_llm(messages, temperature=0.0, max_tokens=300)` builds the `Authorization: Bearer ...` / `Content-Type` headers and the `{"model": "openai/gpt-4o-mini", "messages", "temperature", "max_tokens"}` payload, and posts it to `mock_llm.post(mock_llm.URL, ...)` by default. It returns the reply text only on `200`; retries **only** on `429`, at most 3 times, sleeping `BASE_DELAY * 2**n` seconds before retry `n` (`n = 0, 1, 2`; `BASE_DELAY = 0.05`); raises `LLMError` immediately (no retry) for `400`, `401`, `404`; and prints a note when `finish_reason == "length"`.
+
+**A real endpoint is reachable by configuration alone:** when the environment variable `LLM_MODE=live` is set, `call_llm` instead calls `requests.post` against the real `mock_llm.URL`, reading the key from the `OPENROUTER_API_KEY` environment variable -- the key is never hard-coded in the source. No live call is made during grading; the switch only changes which function (`mock_llm.post` vs. `requests.post`) is used to send the already-built request.
+
+Demonstrations (`python src/llm_client_demo.py`), each after `mock_llm.reset()`:
+
+| Demonstration | Result |
+|---|---|
+| (a) No `Authorization` header | status **401** |
+| (a) Wrong URL | status **404** |
+| (b) `max_tokens=3` | reply truncated, `finish_reason` **"length"** (printed note; reply `'I am'`) |
+| (c) "What is my name?" alone | `"I do not know your name."` |
+| (c) "My name is Asha." + assistant reply + "What is my name?" in the same messages list | `"Your name is Asha."` (no memory across *separate* calls) |
+| (d) 30 simple calls in a loop | **33** total calls to `mock_llm.post` (3 rate-limited responses, each recovered by one retry) |
+
+### B. Prompt design and few-shot classification (`src/ticket_classifier.py`)
+
+Built with `ChatPromptTemplate.from_messages(...) | _call_model | StrOutputParser()`, where `_call_model` is a plain function that takes the prompt value, converts `.to_messages()` (`.type` in `system`/`human`/`ai`, `.content`) to the API's `{"role", "content"}` format, and calls `call_llm`. Run over the **146 readable tickets** (the 4 `...` tickets dropped), `mock_llm.reset()` before each prompt:
+
+| Prompt | Valid labels | Accuracy | Rate limits recovered |
+|---|---|---|---|
+| Weak (`TICKET CLASSIFIER. Classify the ticket.`) | 0 of 146 | -- | 18 |
+| Strong zero-shot (role + task + the 4 labels + "only the label" + no new labels) | 146 of 146 | 123 of 146 (**84.25%**) | 18 |
+| Few-shot (zero-shot + the 13 `few_shot_examples.csv` examples, `Ticket: ...\nLabel: ...` format) | 146 of 146 | 142 of 146 (**97.26%**) | 18 |
+
+`outputs/ticket_classification.csv` holds `ticket_id, true_category, zero_shot, few_shot` for all 146 tickets.
+
+The four tickets few-shot still gets wrong (T0041, T0094, T0110, T0136) all **mention two intents at once** -- e.g. a billing phrase ("recharge went through fine") alongside a plan-change request, or "cancel" alongside a signal complaint, where the *secondary* mentioned intent wins instead of the subscriber's actual (primary) request. Fix: ask the model to identify the subscriber's *primary, action-driving* intent explicitly (e.g. "which intent requires the agent to act first?"), or add a few-shot example that itself contains two intents so the model learns to prioritise one.
+
+Chain-of-thought prompting is worth its extra token cost when the task needs multi-step reasoning the model could get wrong by pattern-matching alone (e.g. multi-constraint arithmetic, policy edge cases). It is not needed here because ticket classification is a short, single-step keyword/semantic match into one of four labels -- the strong/few-shot prompts already reach 84-97% accuracy without any reasoning step, so the extra tokens would not buy a meaningfully better label.
+
+### C. Validated structured extraction with retry and graceful failure (`src/ticket_extraction.py`)
+
+`TicketRecord` (Pydantic): `subscriber_id: Optional[str]`, `category: Literal["billing","signal","plan_change","cancellation","other"]`, `urgency: int = Field(ge=1, le=5)`, `wants_refund: bool`.
+
+| Hand-made input | Result |
+|---|---|
+| `urgency="3"` (string) | coerced to the integer `3` |
+| `urgency=9` | `ValidationError`: field `('urgency',)`, type `less_than_equal` |
+| `category="refund"` | `ValidationError`: field `('category',)`, type `literal_error` |
+
+Chain: `PydanticOutputParser(pydantic_object=TicketRecord)`; a system message starting with `TICKET EXTRACTOR` with `parser.get_format_instructions()` inserted via the prompt's `.partial()` method, and a human message that is exactly the ticket text (no prefix/suffix). On a parser failure, the bad reply is appended as an assistant message and a `VALIDATION ERROR: ...` user message is appended, up to **2 retries**; a ticket that still fails is recorded as `manual_review` and the run continues (never crashes). Processed all 150 tickets of `tickets.csv` in file order after `mock_llm.reset()`:
+
+| Outcome | Count |
+|---|---|
+| Valid on first attempt | **118** |
+| Valid after one retry | **28** |
+| `manual_review` | **4** (the four unreadable `...` tickets) |
+| First-attempt failures (total) | **32** |
+| &nbsp;&nbsp;-- not valid JSON | 16 (12 chatty prose + 4 unreadable) |
+| &nbsp;&nbsp;-- valid JSON but breaks the schema | 16 (6 with `urgency=7`, 10 with an out-of-list `category`) |
+| Rate-limited responses recovered | **23** |
+
+Among the 146 valid records: **31** have `wants_refund = true`, **75** have a null `subscriber_id`. `outputs/ticket_extractions.jsonl` holds one line per ticket (`ticket_id, status, attempts, record`). In production, `manual_review` tickets would be routed to a human agent's queue instead of being auto-processed -- the pipeline never silently guesses a field it couldn't validate.
+
+### D. Retrieval-augmented policy assistant (`src/policy_rag.py`)
+
+**(a) Chunking.** `chunk_text(text, size=400, overlap=60)`: starts at `0, 340, 680, ...` (every `size - overlap` chars), each chunk is `text[start:start+size]`, and a start position is used only while `start + overlap < len(text)`. Applied to the 5 files in `data/policies/`:
+
+| File | Chunks |
+|---|---|
+| cancellation_policy.txt | 2 |
+| plan_change_policy.txt | 3 |
+| recharge_and_refund_policy.txt | 3 |
+| retention_offers_policy.txt | 3 |
+| technical_support_policy.txt | 2 |
+| **Total** | **13** |
+
+**(b) Embed and store.** In-memory `chromadb.Client()`, a collection with cosine distance set explicitly (`metadata={"hnsw:space": "cosine"}`), embedded with `embedding_functions.ONNXMiniLM_L6_V2()`, unique chunk ids and `{source, chunk}` metadata. `retrieve(query, k=3)` returns `source`, `similarity = 1 - distance`, `text`.
+
+**(c) Retrieval evaluation** (`data/raw/policy_eval.csv`, 12 answerable + 4 unanswerable questions):
+
+- Top-3 file hits: **12 of 12**; top-1 file hits: **12 of 12**.
+- Answerable top-1 similarity range: **0.334 to 0.637** (mean **0.514**).
+- Unanswerable top-1 similarities: **0.069, -0.047, 0.295, 0.304**.
+- Keyword baseline (shared non-stopword words, ties to the alphabetically first file) top-1 accuracy: **9 of 12**.
+
+Meaning-based search beats keyword matching here because several questions paraphrase the policy wording (e.g. "top-up" / "recharge", "picture breaking up" / "pixelation") that share few or no literal words with the policy text, while the embedding model still places them close in meaning; a keyword overlap score can't see that connection. Of the 4 unanswerable questions, "Is international roaming available on the mobile app?" comes closest to answerable (similarity 0.304) because "plan"/"app"-flavoured policy language overlaps loosely with it, even though no policy actually covers roaming.
+
+**(d) Calibrate and ground.** Rejection threshold = midpoint of the lowest answerable (0.334) and highest unanswerable (0.304) top-1 similarities = **~0.319** (reference ~0.32). The margin between the two ranges is only **~0.03** wide, so a different embedding build could move a borderline question across the line; if a result ever flips, it should be reported, not hidden. `answer(question)` returns the exact fallback sentence `I don't have enough information to answer that.` without calling the model when the best similarity is below the threshold; otherwise it sends a `POLICY ASSISTANT` system message (instructing the model to use only the context, and to say so otherwise) and a user message of the form `CONTEXT:\n[<file>]\n<chunk>\n\n...\n\nQUESTION:\n<question>`. Run over all 16 questions, grounded vs. ungrounded (no threshold, system message `POLICY ASSISTANT. Answer the question.`):
+
+- Grounded: **12 of 12** answerable answers contain the expected fact; **4 of 4** unanswerable questions get the exact fallback sentence.
+- Ungrounded: every one of the 16 questions gets the **same confident invented answer** (ignoring the actual question and policy text entirely).
+
+`outputs/rag_eval.csv` holds `question, expected_file, top1_source, top1_similarity, hit_at_3, grounded_answer, ungrounded_answer`.
+
+**(e) Chunk size matters.** Rebuilt with `size=200, overlap=30`: **25 chunks** (vs. 13 at 400/60). For the 12 answerable questions: the expected fact is in the top-3 chunks for **11 of 12** (400/60: 12 of 12); grounded answers contain it for **8 of 12** (400/60: 12 of 12). Smaller chunks lost information because a 200-character window more often splits the one sentence that states the policy fact in half across two chunks, so neither chunk alone contains the whole fact, and a chunk that captures only part of a sentence also scores worse against the question during retrieval.
+
+### E. The Retention Copilot (`src/copilot.py`)
+
+`build_brief(subscriber_id)` runs for the 15 subscribers of `outputs/retention_priority.csv`. For each: reads `tenure_months` and the number of failed recharges (`n_failed_6m`, with SQL `NULL` sums treated as 0 via `COALESCE`) from `data/tataplay.db` with SQL; builds the full feature row with the same feature-building logic as Part B (shared in `src/churn_features.py`, imported by both `churn_model.py` and `copilot.py`; `n_success_6m`/`n_failed_6m`/`recency_days` are computed from recharges as of 2026-03-31, and values read back from SQLite as `None` are converted to `NaN` before scoring). The subscriber is re-scored with `outputs/churn_model.joblib` and the result is asserted to agree with the saved `churn_probability` to 4 decimals; `risk_band` is High (>= 0.40), Medium (>= 0.20) or Low otherwise; the segment name comes from `outputs/segments.csv`; the top-3 policy chunks are retrieved with the query `retention offer for a {risk_band} risk subscriber with {tenure_months} months tenure and {n_failed} failed recharges`. The model is called with a `RETENTION BRIEF` system message (JSON-only, policy-context-only) and a `FACTS:` / `POLICY CONTEXT:` user message (`tenure_months` and `failed_recharges_6m` always sent as plain integers). The reply is validated with Pydantic (`RetentionBrief`: `subscriber_id`, `risk_band` a `Literal["High","Medium","Low"]`, `recommended_action`, `policy_source`), retried up to 2 times the same way as task C, plus consistency checks (`subscriber_id`/`risk_band` must equal what was sent, `policy_source` must be a real policy filename).
+
+- **Valid briefs: 15 of 15.** Per `risk_band`: **14 High, 1 Medium**. Per `recommended_action`: 6 free add-on pack, 4 auto-renew setup call, 4 loyalty discount, 1 "No retention offer applies".
+- One subscriber, **TP01015**, has a churn probability of **0.4021** -- right on the High cut-off -- so it is classified High on this run (the reference brief, built on a different library/model build, classified it Medium, giving 13 High / 2 Medium and one more "No offer"). What's graded is that each run's own counts agree with its own probabilities and the rule below; every brief here does.
+
+| Rule (checked against the retrieved policy text) | Action |
+|---|---|
+| High risk **and** >= 3 failed recharges in 6 months | Auto-renew setup call + 7-day grace extension |
+| Else, High risk **and** tenure >= 12 months | Loyalty discount of 15% |
+| Else, High risk | Free add-on pack for 2 months |
+| Medium or Low risk | No retention offer applies |
+
+Every brief's `policy_source` is `retention_offers_policy.txt`. `outputs/retention_briefs.jsonl` holds one line per subscriber: `subscriber_id, status, attempts, facts, brief`.
+
+## Limitations and Next Steps
+
+- **Synthetic data.** All subscribers, recharges, tickets and churn labels are generated by `generate_data.py`, not real Tata Play data -- the exact numbers (accuracy, F1, costs, similarities) reflect this synthetic generator's statistical structure, not real subscriber behaviour.
+- **A single time window.** The churn label, recharge features and revenue-at-risk model are all anchored to one snapshot (2026-03-31) and one six-cycle history; the model has not been validated against a different season or a longer multi-year history, so seasonal effects are unmeasured.
+- **A deterministic mock instead of a real model.** `mock_llm.py` is a rule-based stand-in -- ticket classification, extraction, retrieval grounding and retention briefs all depend on its fixed keyword/regex behaviour, which will not perfectly predict how a real hosted LLM responds to the same prompts (a real model could be more robust, or fail in different ways).
+- **The revenue-at-risk/retention-brief lists are built from test-set subscribers whose outcome is already known.** They illustrate the method on labelled data; they are not a forward-looking evaluation on genuinely unseen subscribers, and churn probabilities for new subscribers in production have not been separately validated.
+- **Thin retrieval-threshold margin.** The rejection threshold (~0.32) sits in a window only ~0.03 wide between the lowest answerable and highest unanswerable similarity -- a different embedding model/version, or a slightly different real-world question, could easily cross that line and flip an answerable question to "I don't have enough information" or vice versa.
+- **Small, templated policy corpus.** Only 5 short policy files exist, each covering one topic; a production system would need many more documents, multi-topic chunks, and a higher-recall retrieval evaluation set before the thresholds here could be trusted at scale.
+
 ## Running the pipeline yourself
 
 ```powershell
@@ -436,4 +565,12 @@ python src/churn_model.py        # 8. Part B: train, tune, select and persist th
 python src/segments.py           # 9. Part C: K-means segmentation -> outputs/segments.csv
 python src/spend_model.py        # 10. Part C: collinearity check + Ridge/Lasso spend model
 python src/revenue_at_risk.py    # 11. Part C: revenue-at-risk priority list -> outputs/retention_priority.csv
+python src/llm_client_demo.py    # 12. Part D: call_llm() demonstrations (401/404/length/memory/rate limit)
+python src/ticket_classifier.py  # 13. Part D: weak/zero-shot/few-shot ticket classification
+python src/ticket_extraction.py  # 14. Part D: validated TicketRecord extraction with retry
+python src/policy_rag.py         # 15. Part D: chunking + retrieval evaluation + grounded answers
+python src/copilot.py            # 16. Part D: Retention Copilot -> outputs/retention_briefs.jsonl
 ```
+
+To point `llm_client.py` at a real endpoint instead of the mock, set `LLM_MODE=live` and `OPENROUTER_API_KEY=<your key>` in the environment before running any Part D script -- no code change is needed, and no key is ever stored in this repository.
+
