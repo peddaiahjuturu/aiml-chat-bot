@@ -17,6 +17,10 @@ src/
   run_queries.py         # runs sql/queries.sql against data/tataplay.db and prints results
   churn_features.py      # builds the Part B churn modelling table (clean subscribers + recharge features)
   churn_model.py         # Part B: split, leakage check, preprocessing, tuning, threshold selection, persistence
+  constants.py           # shared paths and parameters used across the scripts above
+  segments.py            # Part C: K-means subscriber segmentation -> outputs/segments.csv
+  spend_model.py         # Part C: collinearity check + Ridge/Lasso next-cycle-recharge spend model
+  revenue_at_risk.py     # Part C: revenue-at-risk priority list -> outputs/retention_priority.csv
 sql/
   queries.sql            # the four analysis queries (Q1-Q4)
 data/
@@ -27,6 +31,8 @@ data/
 outputs/
   churn_model.joblib      # persisted, fitted churn-prediction pipeline (selected model)
   test_scores.csv         # per-test-subscriber churn probability + actual churned label
+  segments.csv            # subscriber_id, segment_id, segment_name for all 2,400 clean subscribers
+  retention_priority.csv  # top-15 test subscribers ranked by revenue at risk
 ```
 
 ## Requirements
@@ -219,19 +225,6 @@ For "the top spender per city", use **`RANK()`**: `DENSE_RANK()` would mark ever
 
 5 rows; the running total ends at **2,490**.
 
-## Running the pipeline yourself
-
-```powershell
-python generate_data.py          # 1. generate raw data
-python src/audit_data.py         # 2. inspect raw data quality
-python src/clean_subscribers.py  # 3. clean subscribers (must run before recharges)
-python src/clean_recharges.py    # 4. clean recharges (depends on cleaned subscribers)
-python src/clean_plans.py        # 5. copy plans unchanged
-python src/store_db.py           # 6. write the three clean tables to data/tataplay.db
-python src/run_queries.py        # 7. run sql/queries.sql and print the results
-python src/churn_model.py        # 8. Part B: train, tune, select and persist the churn model
-```
-
 ## Part B -- Churn Prediction You Can Trust
 
 Predicts which subscribers will churn, using `data/clean/subscribers.csv` and `data/clean/recharges.csv` from Part A. Run with `python src/churn_model.py` (requires `data/clean/*.csv` to already exist).
@@ -358,3 +351,89 @@ LogisticRegression coefficient signs: `support_calls_90d` **+1.075** (more calls
 The selected (random forest) pipeline is saved with `joblib.dump` to `outputs/churn_model.joblib`; reloading it with `joblib.load` reproduces the exact same test-set predictions. `outputs/test_scores.csv` holds one row per test subscriber (480 rows) with columns `subscriber_id, churn_probability, churned`.
 
 **No test-set leakage:** the `ColumnTransformer` (imputer/scaler/encoder), every model fit, every `GridSearchCV` cross-validation fold, and the cost-based threshold search all only ever see `train` and/or `validation` rows. The `test` set is loaded only once, at the very end, to compute the final confusion matrix/metrics/cost for the already-selected model and its already-chosen threshold -- in that order: **train -> validation -> test**.
+
+## Part C -- Segments, Spend Model and Revenue at Risk
+
+Reads `data/clean/subscribers.csv` (Part A) and `outputs/test_scores.csv` (Part B). Run with `python src/segments.py`, `python src/spend_model.py` and `python src/revenue_at_risk.py` (in that order, after Part B).
+
+### 1. Cluster with K-means
+
+`KMeans(n_clusters=K, n_init=10, random_state=42)` on `StandardScaler`-standardised `tenure_months`, `hours_watched_per_week`, `monthly_recharge_inr` (all 2,400 clean subscribers), swept over K=2..8:
+
+| K | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|
+| inertia | 3728.2 | 2813.0 | 2193.9 | 1781.1 | 1502.5 | 1292.8 | 1191.4 |
+| silhouette | 0.420 | 0.346 | 0.340 | 0.343 | 0.344 | 0.364 | 0.336 |
+
+Inertia always falls as K grows because adding another centroid can only reduce (never increase) the total within-cluster distance, so K=8 beats K=2 on inertia by construction. K=2's silhouette is the best here because splitting the data into two big, well-separated blobs is the easiest shape to score well on average, not because two segments are the most useful split for the business. Neither metric alone picks K: inertia always prefers more clusters and silhouette always prefers fewer, so the final choice needs the elbow (where inertia stops dropping quickly) plus whether the resulting groups are distinct and actionable. **Chosen K = 4.**
+
+### 2. Profile, name and assign
+
+| segment_id | size | mean tenure (months) | mean weekly hours | mean monthly recharge (INR) | churn rate | Name | Recommended action |
+|---|---|---|---|---|---|---|---|
+| 0 | 593 | 23.58 | 7.08 | 301 | 0.22 | Casual Viewer | Light-touch engagement nudges (content recommendations) to lift usage. |
+| 1 | 543 | 34.16 | 22.24 | 560 | 0.13 | Loyal Core | Maintain with standard renewal communication; low-cost to retain. |
+| 2 | 480 | 34.20 | 33.64 | 942 | 0.11 | **Premium** (highest mean monthly recharge) | White-glove support; protect this high-value, low-churn group. |
+| 3 | 784 | 6.32 | 14.85 | 514 | 0.33 | **At-Risk** (highest churn rate) | Proactive retention outreach / discount offer soon after sign-up. |
+
+Segment numbers (0-3) are arbitrary labels with no inherent order -- only the profile above determines the business name.
+
+**New subscriber** (tenure 4 months, 15 hours/week, monthly recharge INR 520), classified by hand: scaled with the fitted `StandardScaler`, then the Euclidean distance to each of the 4 centroids was computed as `[1.708, 2.094, 3.117, 0.153]` -- nearest is segment 3 (**At-Risk**) at distance **0.153** (next nearest, Casual Viewer, at 1.708), and `kmeans.predict` agrees. `outputs/segments.csv` holds `subscriber_id, segment_id, segment_name` for all 2,400 subscribers.
+
+### 3. Collinearity and a spend model (Ridge / Lasso)
+
+Correlation matrix of the four viewing/channel columns -- pairs with |correlation| > 0.9:
+
+| Pair | Correlation |
+|---|---|
+| `hours_watched_per_week` -- `hd_hours_per_week` | 0.979 |
+| `hours_watched_per_week` -- `sports_hours_per_week` | 0.947 |
+| `hours_watched_per_week` -- `channels_watched` | 0.938 |
+| `hd_hours_per_week` -- `sports_hours_per_week` | 0.927 |
+| `hd_hours_per_week` -- `channels_watched` | 0.921 |
+
+(`sports_hours_per_week` -- `channels_watched` = 0.891 is below the 0.9 line.)
+
+Predicting `next_cycle_recharge_inr` for subscribers with `churned = 0` from 7 features (`monthly_recharge_inr, tenure_months, hours_watched_per_week, hd_hours_per_week, sports_hours_per_week, channels_watched, support_calls_90d`), split `train_test_split(test_size=0.2, random_state=42)` into **1,508 train / 378 test** rows. Each is a `StandardScaler` + model pipeline; `Ridge`/`Lasso(max_iter=10000)` alphas tuned with `GridSearchCV(cv=5, scoring="r2")` over `{0.001, 0.01, 0.1, 0.5, 1, 2, 3, 10, 30, 100}`:
+
+| Model | Best alpha | CV R² | Test R² | MAE | RMSE |
+|---|---|---|---|---|---|
+| LinearRegression | -- | 0.994 | 0.993 | 20.16 | 24.70 |
+| Ridge | 0.01 | 0.994 | 0.993 | 20.16 | 24.70 |
+| Lasso | 0.1 | 0.994 | 0.993 | 20.11 | 24.65 |
+
+**Lasso's exactly-zero coefficients:** `tenure_months`, `hours_watched_per_week`, `channels_watched`. Among a group of highly correlated, largely redundant features, keeping just one (`hd_hours_per_week`, plus `sports_hours_per_week`) is enough to carry the shared signal, and Lasso's L1 penalty makes it cheaper overall to drive the others to exactly zero rather than spread a similar-sized coefficient across every member of the group.
+
+**Stability experiment:** fitting `StandardScaler` + `LinearRegression` and `StandardScaler` + `Ridge(alpha=30)` on five random 80% subsamples of the training rows (`random_state=0..4`) and tracking the standardised `hours_watched_per_week` coefficient:
+
+| Model | Coefficients across 5 subsamples | Population std (`ddof=0`) |
+|---|---|---|
+| LinearRegression | -5.731, -1.712, -4.839, -7.736, -4.733 | **1.945** |
+| Ridge(alpha=30) | 13.260, 15.554, 13.581, 13.024, 13.786 | **0.896** |
+
+When features are strongly correlated, plain linear regression can swap weight almost arbitrarily between them from one sample to the next, so an individual coefficient (and even its sign) should not be trusted as a stable business reading; Ridge's penalty shrinks and shares weight across the correlated group, giving a noticeably more stable, more trustworthy coefficient.
+
+### 4. Revenue at risk
+
+For the 480 Part B test subscribers, the tuned Ridge pipeline predicts `next_cycle_recharge_inr` for every subscriber (including those who churned), and `revenue_at_risk_inr = churn_probability x predicted_next_recharge_inr`. The top 15 by revenue at risk are written to `outputs/retention_priority.csv` (`subscriber_id, churn_probability, predicted_next_recharge_inr, revenue_at_risk_inr, segment_name, churned`):
+
+- Sum of revenue at risk (top 15): **INR 8,717**
+- **12 of 15** actually churned (bar: at least 9 -- **pass**; base churn rate is 21%)
+
+This list is built from test-set subscribers whose outcome (`churned`) is already known -- it illustrates the revenue-at-risk method, it is **not** a forward-looking evaluation of unseen subscribers.
+
+## Running the pipeline yourself
+
+```powershell
+python generate_data.py          # 1. generate raw data
+python src/audit_data.py         # 2. inspect raw data quality
+python src/clean_subscribers.py  # 3. clean subscribers (must run before recharges)
+python src/clean_recharges.py    # 4. clean recharges (depends on cleaned subscribers)
+python src/clean_plans.py        # 5. copy plans unchanged
+python src/store_db.py           # 6. write the three clean tables to data/tataplay.db
+python src/run_queries.py        # 7. run sql/queries.sql and print the results
+python src/churn_model.py        # 8. Part B: train, tune, select and persist the churn model
+python src/segments.py           # 9. Part C: K-means segmentation -> outputs/segments.csv
+python src/spend_model.py        # 10. Part C: collinearity check + Ridge/Lasso spend model
+python src/revenue_at_risk.py    # 11. Part C: revenue-at-risk priority list -> outputs/retention_priority.csv
+```

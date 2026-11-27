@@ -21,6 +21,8 @@ SQL_QUERIES_PATH = os.path.join(SQL_DIR, "queries.sql")
 
 MODEL_PATH = os.path.join(OUTPUT_DIR, "churn_model.joblib")
 SCORES_PATH = os.path.join(OUTPUT_DIR, "test_scores.csv")
+SEGMENTS_PATH = os.path.join(OUTPUT_DIR, "segments.csv")
+PRIORITY_PATH = os.path.join(OUTPUT_DIR, "retention_priority.csv")
 
 SNAPSHOT = pd.Timestamp("2026-03-31")
 RANDOM_STATE = 42
