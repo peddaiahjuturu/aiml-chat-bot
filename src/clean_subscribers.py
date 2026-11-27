@@ -9,12 +9,9 @@ Rules applied, in order:
   3. Standardise auto_renew to exactly "Yes" or "No" (case variants and single-letter codes).
   4. Set age to missing (NaN) wherever it is outside the plausible range of 10-100.
 """
-import os
 import pandas as pd
 
-RAW_PATH = os.path.join("data", "raw", "subscribers.csv")
-CLEAN_DIR = os.path.join("data", "clean")
-CLEAN_PATH = os.path.join(CLEAN_DIR, "subscribers.csv")
+from data_cleaner import BaseCleaner
 
 CITY_MAP = {
     "chennai": "Chennai", "madras": "Chennai",
@@ -28,39 +25,40 @@ CITY_MAP = {
 AUTO_RENEW_MAP = {"yes": "Yes", "y": "Yes", "no": "No", "n": "No"}
 
 
-def clean(path):
-    df = pd.read_csv(path)
-    rules = []
+class SubscribersCleaner(BaseCleaner):
+    def __init__(self):
+        super().__init__("subscribers.csv", "subscribers.csv")
 
-    before = len(df)
-    df = df.drop_duplicates()
-    rules.append(("Removed exact duplicate rows", before - len(df)))
+    def clean(self, df):
+        rules = []
 
-    std_city = df["city"].astype(str).str.strip().str.lower().map(CITY_MAP)
-    changed = (std_city != df["city"]).sum()
-    df["city"] = std_city
-    rules.append(("Standardised city to one of 7 canonical names", int(changed)))
+        before = len(df)
+        df = df.drop_duplicates()
+        rules.append(("Removed exact duplicate rows", before - len(df)))
 
-    std_auto = df["auto_renew"].astype(str).str.strip().str.lower().map(AUTO_RENEW_MAP)
-    changed = (std_auto != df["auto_renew"]).sum()
-    df["auto_renew"] = std_auto
-    rules.append(("Standardised auto_renew to Yes/No", int(changed)))
+        std_city = df["city"].astype(str).str.strip().str.lower().map(CITY_MAP)
+        changed = (std_city != df["city"]).sum()
+        df["city"] = std_city
+        rules.append(("Standardised city to one of 7 canonical names", int(changed)))
 
-    age = pd.to_numeric(df["age"], errors="coerce")
-    out_of_range = age.notna() & ((age < 10) | (age > 100))
-    df["age"] = age.mask(out_of_range)
-    rules.append(("Set age to missing where outside 10-100", int(out_of_range.sum())))
+        std_auto = df["auto_renew"].astype(str).str.strip().str.lower().map(AUTO_RENEW_MAP)
+        changed = (std_auto != df["auto_renew"]).sum()
+        df["auto_renew"] = std_auto
+        rules.append(("Standardised auto_renew to Yes/No", int(changed)))
 
-    return df, rules
+        age = pd.to_numeric(df["age"], errors="coerce")
+        out_of_range = age.notna() & ((age < 10) | (age > 100))
+        df["age"] = age.mask(out_of_range)
+        rules.append(("Set age to missing where outside 10-100", int(out_of_range.sum())))
+
+        return df, rules
+
+    def summary_lines(self, df):
+        return [
+            f"Cities: {sorted(df['city'].dropna().unique())}",
+            f"auto_renew values: {sorted(df['auto_renew'].dropna().unique())}",
+        ]
 
 
 if __name__ == "__main__":
-    clean_df, rules = clean(RAW_PATH)
-    os.makedirs(CLEAN_DIR, exist_ok=True)
-    clean_df.to_csv(CLEAN_PATH, index=False)
-
-    print(f"Rows: {len(clean_df)}")
-    print(f"Cities: {sorted(clean_df['city'].dropna().unique())}")
-    print(f"auto_renew values: {sorted(clean_df['auto_renew'].dropna().unique())}\n")
-    for name, count in rules:
-        print(f"- {name}: {count}")
+    SubscribersCleaner().run()
