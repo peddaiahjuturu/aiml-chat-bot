@@ -1,8 +1,15 @@
 # AIML Chat Bot -- Tata Play Subscriber Retention & Support Copilot (Capstone)
 
-Synthetic-data pipeline and offline mock LLM for a subscriber retention / support chatbot capstone project.
+## Overview
 
-## Project structure
+A capstone pipeline for a Tata Play subscriber retention / support chatbot, built entirely on synthetic data and an offline mock LLM (`mock_llm.py`, no key/network/cost needed):
+
+- **Part A -- Data Foundation:** audits, cleans and stores the raw subscriber/recharge/plan data, and answers four SQL analysis queries.
+- **Part B -- Churn Prediction:** builds a leakage-free churn model (logistic regression vs. random forest), tunes it with cross-validation, picks a cost-based alert threshold, and evaluates once on a held-out test set.
+- **Part C -- Segments, Spend Model and Revenue at Risk:** K-means subscriber segmentation, a Ridge/Lasso next-cycle-recharge spend model, and a revenue-at-risk priority list.
+- **Part D -- Support Copilot:** a reliable LLM client, few-shot ticket classification, validated structured ticket extraction, a ChromaDB retrieval-augmented policy assistant, and a Retention Copilot that writes a validated brief per at-risk subscriber.
+
+### Project structure
 
 ```
 generate_data.py        # creates all synthetic raw data + policy docs (stdlib only)
@@ -45,23 +52,26 @@ outputs/
   retention_briefs.jsonl     # one validated retention brief per priority-list subscriber (15)
 ```
 
-## Requirements
+### Requirements
 
-Minimum packages (see [requirements.txt](requirements.txt)):
+Key packages (see [requirements.txt](requirements.txt) for the full pinned list, generated with `pip freeze`):
 
 | Package | Purpose |
 |---|---|
-| `pandas` | Reading/cleaning/auditing the CSV tables (core data-processing library used throughout `src/`) |
-| `numpy` | Numerical operations, required by `pandas` |
-| `requests` | HTTP client, used to call chat-completion APIs with the same shape as `mock_llm.py` |
+| `pandas`, `numpy` | Core data processing used throughout `src/` (Parts A-D) |
+| `requests` | HTTP client; also the shape `llm_client.py` uses when `LLM_MODE=live` |
 | `python-dotenv` | Loads API keys/config from a local `.env` file |
-| `python-dateutil` | Date parsing support used by `pandas` |
-| `tzdata` | Timezone database required by `pandas`/`python-dateutil` on some platforms |
-| `certifi`, `charset-normalizer`, `idna`, `urllib3` | Transitive dependencies of `requests` (TLS certificates, encoding detection, URL handling) |
+| `scikit-learn`, `joblib` | Part B/C models, pipelines, cross-validation, and model persistence |
+| `langchain-core` | `ChatPromptTemplate`, `StrOutputParser`, `PydanticOutputParser` (Part D) |
+| `pydantic` | `TicketRecord` / `RetentionBrief` validation (Part D) |
+| `chromadb` | In-memory vector store + built-in ONNX MiniLM embeddings for the policy RAG assistant (Part D) |
+| `python-dateutil`, `tzdata`, `certifi`, `charset-normalizer`, `idna`, `urllib3` | Transitive dependencies of `pandas`/`requests` |
 
 `generate_data.py` and `mock_llm.py` use only the Python standard library and need no extra packages.
 
-## Setup (for anyone cloning this repo)
+## Reproduce
+
+### Setup (for anyone cloning this repo)
 
 1. **Create a virtual environment** (from the repo root):
    ```powershell
@@ -95,11 +105,34 @@ Minimum packages (see [requirements.txt](requirements.txt)):
 
    > **Do not use these two columns as features:** `closure_request_logged` and `next_cycle_recharge_inr`. They are not known at prediction time (they are only logged/known once a subscriber is already leaving or has started their next billing cycle), so they must be excluded from any churn-prediction model to avoid data leakage.
 
+### Run the full pipeline, in order
+
+```powershell
+python generate_data.py          # 1. generate raw data
+python src/audit_data.py         # 2. inspect raw data quality
+python src/clean_subscribers.py  # 3. clean subscribers (must run before recharges)
+python src/clean_recharges.py    # 4. clean recharges (depends on cleaned subscribers)
+python src/clean_plans.py        # 5. copy plans unchanged
+python src/store_db.py           # 6. write the three clean tables to data/tataplay.db
+python src/run_queries.py        # 7. run sql/queries.sql and print the results
+python src/churn_model.py        # 8. Part B: train, tune, select and persist the churn model
+python src/segments.py           # 9. Part C: K-means segmentation -> outputs/segments.csv
+python src/spend_model.py        # 10. Part C: collinearity check + Ridge/Lasso spend model
+python src/revenue_at_risk.py    # 11. Part C: revenue-at-risk priority list -> outputs/retention_priority.csv
+python src/llm_client_demo.py    # 12. Part D: call_llm() demonstrations (401/404/length/memory/rate limit)
+python src/ticket_classifier.py  # 13. Part D: weak/zero-shot/few-shot ticket classification
+python src/ticket_extraction.py  # 14. Part D: validated TicketRecord extraction with retry
+python src/policy_rag.py         # 15. Part D: chunking + retrieval evaluation + grounded answers
+python src/copilot.py            # 16. Part D: Retention Copilot -> outputs/retention_briefs.jsonl
+```
+
+To point `llm_client.py` at a real endpoint instead of the mock, set `LLM_MODE=live` and `OPENROUTER_API_KEY=<your key>` in the environment before running any Part D script -- no code change is needed, and no key is ever stored in this repository.
+
 ## Part A -- Data Foundation: Audit, Clean, Store, Query
 
 Everything downstream trusts this Part. The raw exports contain duplicates, inconsistent spellings, impossible values and text where numbers belong. This Part produces the clean tables and the SQLite database that Parts B, C and D read. Data is cleaned in pandas; no missing value is filled in this Part (imputation belongs inside the Part B pipeline, after the split, so that no test row can influence it).
 
-## Steps completed so far
+### Steps completed so far
 
 1. Generated synthetic raw data with `generate_data.py` (2,415 subscribers, 13,055 raw recharges, 150 tickets, and 5 policy documents).
 2. Audited the raw tables with `src/audit_data.py` to understand shape, dtypes, missing values, duplicate rows, and spelling/id inconsistencies before cleaning.
@@ -186,7 +219,7 @@ No missing value is ever filled in by the cleaning scripts -- cleaning only remo
 
 - Copied unchanged (6 rows, no cleaning needed).
 
-## Store and query
+### Store and query
 
 `src/store_db.py` writes the three clean tables (`subscribers`, `recharges`, `plans`) to `data/tataplay.db` using `sqlite3` + `DataFrame.to_sql`. `sql/queries.sql` holds four analysis queries, run from Python with `src/run_queries.py` (uses `sqlite3` + `pandas.read_sql_query`). Unless stated otherwise, every query uses only `status = 'success'` recharges.
 
@@ -550,27 +583,4 @@ Every brief's `policy_source` is `retention_offers_policy.txt`. `outputs/retenti
 - **The revenue-at-risk/retention-brief lists are built from test-set subscribers whose outcome is already known.** They illustrate the method on labelled data; they are not a forward-looking evaluation on genuinely unseen subscribers, and churn probabilities for new subscribers in production have not been separately validated.
 - **Thin retrieval-threshold margin.** The rejection threshold (~0.32) sits in a window only ~0.03 wide between the lowest answerable and highest unanswerable similarity -- a different embedding model/version, or a slightly different real-world question, could easily cross that line and flip an answerable question to "I don't have enough information" or vice versa.
 - **Small, templated policy corpus.** Only 5 short policy files exist, each covering one topic; a production system would need many more documents, multi-topic chunks, and a higher-recall retrieval evaluation set before the thresholds here could be trusted at scale.
-
-## Running the pipeline yourself
-
-```powershell
-python generate_data.py          # 1. generate raw data
-python src/audit_data.py         # 2. inspect raw data quality
-python src/clean_subscribers.py  # 3. clean subscribers (must run before recharges)
-python src/clean_recharges.py    # 4. clean recharges (depends on cleaned subscribers)
-python src/clean_plans.py        # 5. copy plans unchanged
-python src/store_db.py           # 6. write the three clean tables to data/tataplay.db
-python src/run_queries.py        # 7. run sql/queries.sql and print the results
-python src/churn_model.py        # 8. Part B: train, tune, select and persist the churn model
-python src/segments.py           # 9. Part C: K-means segmentation -> outputs/segments.csv
-python src/spend_model.py        # 10. Part C: collinearity check + Ridge/Lasso spend model
-python src/revenue_at_risk.py    # 11. Part C: revenue-at-risk priority list -> outputs/retention_priority.csv
-python src/llm_client_demo.py    # 12. Part D: call_llm() demonstrations (401/404/length/memory/rate limit)
-python src/ticket_classifier.py  # 13. Part D: weak/zero-shot/few-shot ticket classification
-python src/ticket_extraction.py  # 14. Part D: validated TicketRecord extraction with retry
-python src/policy_rag.py         # 15. Part D: chunking + retrieval evaluation + grounded answers
-python src/copilot.py            # 16. Part D: Retention Copilot -> outputs/retention_briefs.jsonl
-```
-
-To point `llm_client.py` at a real endpoint instead of the mock, set `LLM_MODE=live` and `OPENROUTER_API_KEY=<your key>` in the environment before running any Part D script -- no code change is needed, and no key is ever stored in this repository.
 
