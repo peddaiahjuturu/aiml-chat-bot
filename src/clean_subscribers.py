@@ -32,20 +32,24 @@ class SubscribersCleaner(BaseCleaner):
     def clean(self, df):
         rules = []
 
+        # Remove exact duplicate rows first
         before = len(df)
         df = df.drop_duplicates()
         rules.append(("Removed exact duplicate rows", before - len(df)))
 
+        # Standardise city names to one of the 7 canonical cities
         std_city = df["city"].astype(str).str.strip().str.lower().map(CITY_MAP)
         changed = (std_city != df["city"]).sum()
         df["city"] = std_city
         rules.append(("Standardised city to one of 7 canonical names", int(changed)))
 
+        # Standardise auto_renew to exactly "Yes" or "No"
         std_auto = df["auto_renew"].astype(str).str.strip().str.lower().map(AUTO_RENEW_MAP)
         changed = (std_auto != df["auto_renew"]).sum()
         df["auto_renew"] = std_auto
         rules.append(("Standardised auto_renew to Yes/No", int(changed)))
 
+        # Set age to missing (NaN) wherever it is outside the plausible range of 10-100
         age = pd.to_numeric(df["age"], errors="coerce")
         out_of_range = age.notna() & ((age < 10) | (age > 100))
         df["age"] = age.mask(out_of_range)

@@ -3,8 +3,9 @@ Run:  python src/audit_data.py"""
 import os
 import pandas as pd
 
-SUBSCRIBERS_PATH = os.path.join("data", "raw", "subscribers.csv")
-RECHARGES_PATH = os.path.join("data", "raw", "recharges.csv")
+RAW_DATA_PATH = os.path.join("data", "raw")
+SUBSCRIBERS_PATH = os.path.join(RAW_DATA_PATH, "subscribers.csv")
+RECHARGES_PATH = os.path.join(RAW_DATA_PATH, "recharges.csv")
 
 
 def audit(path):
@@ -12,6 +13,7 @@ def audit(path):
     print(f"Table: {path}")
     print(f"Shape: {df.shape[0]} rows x {df.shape[1]} columns\n")
 
+    # Print column data types and missing values
     missing = df.isna().sum()
     pct = (missing / len(df) * 100).round(2)
     report = pd.DataFrame({"dtype": df.dtypes.astype(str), "missing_count": missing, "missing_pct": pct})

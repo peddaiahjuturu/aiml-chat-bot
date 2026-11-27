@@ -28,24 +28,29 @@ class RechargesCleaner(BaseCleaner):
         subscribers_path = SUBSCRIBERS_CLEAN_PATH if os.path.exists(SUBSCRIBERS_CLEAN_PATH) else SUBSCRIBERS_RAW_PATH
         valid_ids = set(pd.read_csv(subscribers_path)["subscriber_id"])
 
+        # Remove exact duplicate rows first
         before = len(df)
         df = df.drop_duplicates()
         rules.append(("Removed exact duplicate rows", before - len(df)))
 
+        # Remove recharges whose subscriber_id does not exist in the cleaned subscribers table
         before = len(df)
         df = df[df["subscriber_id"].isin(valid_ids)]
         rules.append(("Removed recharges for unknown subscribers", before - len(df)))
 
+        # Lower-case the status column
         status_lower = df["status"].astype(str).str.lower()
         changed = (status_lower != df["status"]).sum()
         df["status"] = status_lower
         rules.append(("Lower-cased status", int(changed)))
 
+        # Rebuild amount_inr as a number, stripping a leading "INR " text prefix where present
         amount_text = df["amount_inr"].astype(str).str.strip()
         rebuilt = amount_text.str.contains(r"[A-Za-z]", regex=True)
         df["amount_inr"] = pd.to_numeric(amount_text.str.replace(r"[A-Za-z]+", "", regex=True).str.strip(), errors="coerce")
         rules.append(("Rebuilt amount_inr as a number (stripped 'INR ' text)", int(rebuilt.sum())))
 
+        # Parse recharge_date into an actual date type
         parsed_date = pd.to_datetime(df["recharge_date"], errors="coerce")
         failed = parsed_date.isna() & df["recharge_date"].notna()
         df["recharge_date"] = parsed_date
